@@ -415,9 +415,3 @@ Consider partitioning output data by date for better query performance:
 ```python
 df.write.partitionBy("year", "month").mode("overwrite").csv(output_path)
 ```
-
-## License and Usage
-
-Copyright © 2025 Zimeng Lyu. All rights reserved.
-
-This project is for educational purposes as part of RIT DSCI-644 course. Usage as teaching material requires explicit permission from the author.
