@@ -1,0 +1,200 @@
+image: python:3.12
+
+stages:
+  - format
+  - security
+  - files
+  - validation
+  - complexity
+
+format_check:
+  stage: format
+  before_script:
+    - pip install black
+  script:
+    - echo "Checking code formatting with black..."
+    - black --check . || (echo "❌ Code formatting check failed. Please run 'black .' to format your code." && exit 1)
+    - echo "✅ Code formatting check passed!"
+  only:
+    - merge_requests
+    - main
+
+security_check:
+  stage: security
+  script:
+    - echo "Checking for sensitive files..."
+    - |
+      if git diff --name-only origin/main $CI_COMMIT_SHA | grep -q ".env$"; then
+        echo "❌ Error: .env file detected in commit. Remove it and add to .gitignore"
+        exit 1
+      fi
+    - echo "✅ No sensitive files found in commit!"
+  only:
+    - merge_requests
+    - main
+
+protected_files:
+  stage: files
+  variables:
+    GIT_DEPTH: 0  # Get full git history
+  script:
+    - echo "Checking protected files..."
+    - |
+      PROTECTED_FILES=("config.yaml")
+      for file in "${PROTECTED_FILES[@]}"; do
+        if git diff --name-only origin/main $CI_COMMIT_SHA | grep -q "$file"; then
+          echo "❌ Error: $file has been modified. This file is protected and should not be changed."
+          exit 1
+        fi
+      done
+    - echo "✅ No protected files were modified!"
+    - echo "Checking required file updates..."
+    - |
+      # Check if main.py has been modified
+      if diff <(git show origin/main:src/main.py) <(git show $CI_COMMIT_SHA:src/main.py) >/dev/null 2>&1; then
+        echo "❌ Error: No changes detected in src/main.py compared to main branch. This file must be updated."
+        exit 1
+      fi
+    - |
+      # Check if data_processor.py has been modified
+      if diff <(git show origin/main:src/data_processor.py) <(git show $CI_COMMIT_SHA:src/data_processor.py) >/dev/null 2>&1; then
+        echo "❌ Error: No changes detected in data_processor.py compared to main branch. You must implement the required methods in this file."
+        exit 1
+      fi
+    - |
+      # Check if .gitlab-ci.yml remains unchanged
+      git fetch origin main
+      if ! diff <(git show origin/main:.gitlab-ci.yml) <(git show $CI_COMMIT_SHA:.gitlab-ci.yml) >/dev/null 2>&1; then
+        echo "❌ Error: .gitlab-ci.yml has been modified. This file should not be changed."
+        exit 1
+      fi
+    - echo "✅ All file checks passed!"
+  only:
+    - merge_requests
+    - main
+
+data_validation:
+  stage: validation
+  before_script:
+    - pip install pandas numpy
+  script:
+    - echo "Checking CSV files existence..."
+    - |
+      CSV_FILES=("monthly_stock_data.csv" "daily_stock_data.csv" "quarterly_stock_data.csv" "hourly_stock_data.csv")
+      for file in "${CSV_FILES[@]}"; do
+        if [ ! -f "data/output/$file" ]; then
+          echo "❌ Error: data/output/$file does not exist!"
+          exit 1
+        fi
+        if [ ! -f "data/answers/$file" ]; then
+          echo "❌ Error: data/answers/$file does not exist!"
+          exit 1
+        fi
+      done
+    - echo "✅ All CSV files exist!"
+    - |
+      python3 - << 'EOF'
+      import pandas as pd
+      import numpy as np
+      
+      def compare_csvs(file_name):
+          print(f"\nChecking {file_name}...")
+          output_df = pd.read_csv(f'data/output/{file_name}')
+          answer_df = pd.read_csv(f'data/answers/{file_name}')
+          has_errors = False
+          
+          # Check if dataframes have same shape
+          if output_df.shape != answer_df.shape:
+              print(f"❌ Shape mismatch in {file_name}!")
+              print(f"Expected shape: {answer_df.shape}, Got: {output_df.shape}")
+              has_errors = True
+              
+          # Check column names
+          if not all(output_df.columns == answer_df.columns):
+              print(f"❌ Column names don't match in {file_name}!")
+              print("Missing columns:", set(answer_df.columns) - set(output_df.columns))
+              print("Extra columns:", set(output_df.columns) - set(answer_df.columns))
+              has_errors = True
+          
+          # Compare values
+          for col in answer_df.columns:
+              if col in ['avg_price', 'market_index']:  # Float columns
+                  if not np.allclose(output_df[col], answer_df[col], rtol=1e-5):
+                      diff_mask = ~np.isclose(output_df[col], answer_df[col], rtol=1e-5)
+                      diff_indices = output_df.index[diff_mask]
+                      print(f"❌ Differences found in column '{col}':")
+                      for idx in diff_indices[:5]:  # Show first 5 differences
+                          print(f"Row {idx}:")
+                          print(f"Expected: {answer_df.loc[idx, col]}")
+                          print(f"Got: {output_df.loc[idx, col]}")
+                      has_errors = True
+              else:  # Non-float columns
+                  if not (output_df[col] == answer_df[col]).all():
+                      diff_mask = output_df[col] != answer_df[col]
+                      diff_indices = output_df.index[diff_mask]
+                      print(f"❌ Differences found in column '{col}':")
+                      for idx in diff_indices[:5]:  # Show first 5 differences
+                          print(f"Row {idx}:")
+                          print(f"Expected: {answer_df.loc[idx, col]}")
+                          print(f"Got: {output_df.loc[idx, col]}")
+                      has_errors = True
+          
+          if has_errors:
+              print(f"❌ {file_name} validation failed, but continuing with other files...")
+              return False
+          print(f"✅ {file_name} validation passed!")
+          return True
+      
+      files = ['monthly_stock_data.csv', 'daily_stock_data.csv', 
+               'quarterly_stock_data.csv', 'hourly_stock_data.csv']
+      
+      all_passed = True
+      for file in files:
+          if not compare_csvs(file):
+              all_passed = False
+      
+      print("\nFinal Results:")
+      if all_passed:
+          print("✅ All files passed validation!")
+      else:
+          print("❌ Some files had validation errors. Check the logs above for details.")
+      
+      exit(0 if all_passed else 1)
+      EOF
+  allow_failure: true
+  only:
+    - merge_requests
+    - main
+
+function_length_check:
+  stage: complexity
+  before_script:
+    - pip install flake8 mccabe
+  script:
+    - echo "Checking function length and complexity..."
+    - |
+      # Create a temporary file to store flake8 output
+      flake8 . --max-complexity=10 --max-function-length=50 \
+        --select=C901,CFQ \
+        --per-file-ignores="__init__.py:F401" \
+        --format="%(path)s:%(row)d: [%(code)s] %(text)s" > flake8_output.txt || true
+      
+      if [ -s flake8_output.txt ]; then
+        echo "❌ Found the following issues:"
+        echo "------------------------------"
+        # Display complexity issues
+        echo "Complexity issues (C901):"
+        grep "C901" flake8_output.txt || echo "None"
+        echo
+        # Display function length issues
+        echo "Function length issues (CFQ):"
+        grep "CFQ" flake8_output.txt || echo "None"
+        echo "------------------------------"
+        echo "Please refactor the functions above to reduce their complexity and/or length."
+        exit 1
+      else
+        echo "✅ All functions are within acceptable length and complexity!"
+      fi
+  only:
+    - merge_requests
+    - main
